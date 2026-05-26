@@ -1,0 +1,99 @@
+version: "3.9"
+
+services:
+  # ── PostgreSQL 16 ──────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: ims-postgres-prod
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secure-prod-db-password}
+      POSTGRES_DB: incident_db
+    # Do not expose port 5432 to the public internet in production for security.
+    # It will only be accessible within the docker bridge network.
+    expose:
+      - "5432"
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ims-prod-network
+    restart: always
+
+  # ── Redis 7.4 ──────────────────────────────────────────────
+  redis:
+    image: redis:7.4-alpine
+    container_name: ims-redis-prod
+    # Do not expose Redis publicly.
+    expose:
+      - "6379"
+    volumes:
+      - redis_prod_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ims-prod-network
+    restart: always
+
+  # ── Backend (FastAPI) ──────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    container_name: ims-backend-prod
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:${DB_PASSWORD:-secure-prod-db-password}@postgres:5432/incident_db
+      REDIS_URL: redis://redis:6379/0
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      SECRET_KEY: ${SECRET_KEY}
+      DEBUG: "false"
+      ESCALATION_P1: ${ESCALATION_P1:-300}
+      ESCALATION_P2: ${ESCALATION_P2:-900}
+      ESCALATION_P3: ${ESCALATION_P3:-1800}
+      ESCALATION_P4: ${ESCALATION_P4:-3600}
+      CORS_ORIGINS: '["${PROD_DOMAIN_HTTPS}", "${PROD_DOMAIN_HTTP}"]'
+    # Bind to localhost (127.0.0.1) so it is only accessible via host's reverse proxy (Nginx).
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ims-prod-network
+    restart: unless-stopped
+
+  # ── Frontend (Next.js) ─────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        # Build-time args to embed the correct public URL/Websocket into client bundle
+        - NEXT_PUBLIC_API_URL=${PROD_DOMAIN_HTTPS}
+        - NEXT_PUBLIC_WS_URL=${PROD_DOMAIN_WSS}
+    container_name: ims-frontend-prod
+    # Bind to localhost (127.0.0.1) so it is only accessible via host's reverse proxy (Nginx).
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - ims-prod-network
+    restart: unless-stopped
+
+volumes:
+  postgres_prod_data:
+  redis_prod_data:
+
+networks:
+  ims-prod-network:
+    driver: bridge

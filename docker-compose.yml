@@ -47,6 +47,12 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/incident_db
       REDIS_URL: redis://redis:6379/0
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      SECRET_KEY: ${SECRET_KEY}
+      ESCALATION_P1: ${ESCALATION_P1}
+      ESCALATION_P2: ${ESCALATION_P2}
+      ESCALATION_P3: ${ESCALATION_P3}
+      ESCALATION_P4: ${ESCALATION_P4}
     ports:
       - "8000:8000"
     volumes:

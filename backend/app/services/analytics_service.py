@@ -1,12 +1,12 @@
 """
 Analytics Service — Service 4
-AI-powered analytics using Gemini 2.0 Flash.
+AI-powered analytics using Gemini API (via direct REST calls).
 Generates post-mortem reports, clusters incidents, and predicts recurrence.
 """
 import json
 
+import httpx
 import structlog
-import google.generativeai as genai
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,11 +19,61 @@ from app.events.subscriber import register_handler
 logger = structlog.get_logger(__name__)
 settings = get_settings()
 
+# Models to try in order (cheapest/most available first)
+GEMINI_MODELS = [
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-latest",
+]
+GEMINI_REST_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
-def _configure_genai():
-    """Configure Gemini API client."""
-    if settings.GEMINI_API_KEY:
-        genai.configure(api_key=settings.GEMINI_API_KEY)
+
+async def _call_gemini(prompt: str) -> str:
+    """
+    Call Gemini REST API directly via httpx.
+    Tries multiple models in order until one succeeds.
+    Returns the response text.
+    """
+    if not settings.GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY is not configured")
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": 2048,
+        },
+    }
+
+    last_error = None
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for model in GEMINI_MODELS:
+            url = f"{GEMINI_REST_BASE}/{model}:generateContent?key={settings.GEMINI_API_KEY}"
+            try:
+                resp = await client.post(url, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                elif resp.status_code == 429:
+                    # Quota exhausted — try next model
+                    last_error = f"Model {model} quota exhausted (429)"
+                    await logger.awarning("Gemini quota exhausted, trying next model", model=model)
+                    continue
+                elif resp.status_code == 404:
+                    last_error = f"Model {model} not found (404)"
+                    continue
+                else:
+                    last_error = f"Model {model} returned HTTP {resp.status_code}: {resp.text[:200]}"
+                    continue
+            except httpx.TimeoutException:
+                last_error = f"Model {model} timed out"
+                continue
+            except Exception as e:
+                last_error = f"Model {model} error: {str(e)}"
+                continue
+
+    raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
 
 
 class AnalyticsService:
@@ -31,7 +81,6 @@ class AnalyticsService:
 
     def __init__(self, db: AsyncSession):
         self.db = db
-        _configure_genai()
 
     async def generate_postmortem(self, incident_id: int) -> PostMortem | None:
         """Generate an AI post-mortem report for a resolved incident."""
@@ -77,11 +126,10 @@ Please generate a post-mortem with the following sections. Return ONLY valid JSO
                 # Fallback: generate a template post-mortem without AI
                 return await self._generate_template_postmortem(incident, ttr)
 
-            model = genai.GenerativeModel("gemini-2.0-flash")
-            response = model.generate_content(prompt)
+            response_text = await _call_gemini(prompt)
 
             # Parse JSON from response
-            response_text = response.text.strip()
+            response_text = response_text.strip()
             # Remove markdown code blocks if present
             if response_text.startswith("```"):
                 response_text = response_text.split("\n", 1)[1]
@@ -99,7 +147,7 @@ Please generate a post-mortem with the following sections. Return ONLY valid JSO
                 action_items=pm_data.get("action_items", ""),
                 lessons_learned=pm_data.get("lessons_learned"),
                 generated_by_ai=True,
-                ai_model="gemini-2.0-flash",
+                ai_model="gemini-via-rest",
             )
 
             self.db.add(postmortem)
@@ -205,12 +253,14 @@ Please generate a post-mortem with the following sections. Return ONLY valid JSO
         }
 
     async def get_ai_insights(self) -> dict:
-        """Get AI-generated insights from incident patterns."""
+        """Get AI-generated insights from incident patterns.
+        Falls back to smart rule-based analysis when Gemini quota is exhausted.
+        """
         clusters = await self.get_incident_clusters()
 
         if not settings.GEMINI_API_KEY:
             return {
-                "insights": "AI insights require a Gemini API key. Configure GEMINI_API_KEY to enable.",
+                "insights": self._generate_statistical_insights(clusters),
                 "clusters": clusters,
             }
 
@@ -230,9 +280,8 @@ Provide 3-5 actionable insights as a JSON array:
 ]"""
 
         try:
-            model = genai.GenerativeModel("gemini-2.0-flash")
-            response = model.generate_content(prompt)
-            response_text = response.text.strip()
+            response_text = await _call_gemini(prompt)
+            response_text = response_text.strip()
             if response_text.startswith("```"):
                 response_text = response_text.split("\n", 1)[1]
                 response_text = response_text.rsplit("```", 1)[0]
@@ -240,8 +289,115 @@ Provide 3-5 actionable insights as a JSON array:
             insights = json.loads(response_text)
             return {"insights": insights, "clusters": clusters}
         except Exception as e:
-            await logger.aerror("Failed to generate AI insights", error=str(e))
-            return {"insights": "Failed to generate AI insights", "clusters": clusters}
+            err_msg = str(e)
+            await logger.awarning("Gemini unavailable, using statistical insights", error=err_msg[:200])
+            # Graceful degradation: generate rule-based insights from real data
+            return {
+                "insights": self._generate_statistical_insights(clusters),
+                "clusters": clusters,
+            }
+
+    def _generate_statistical_insights(self, clusters: dict) -> list:
+        """Generate rule-based insights from statistical analysis when AI is unavailable."""
+        insights = []
+        total = clusters.get("total_analyzed", 0)
+        sev_dist = clusters.get("severity_distribution", {})
+        status_dist = clusters.get("status_distribution", {})
+        avg_mttr = clusters.get("avg_mttr_by_severity", {})
+        top_tags = clusters.get("top_tags", [])
+        peak_hour = clusters.get("peak_hour")
+
+        if total == 0:
+            return [{"insight": "No incidents to analyze", "severity": "low",
+                     "recommendation": "System is running normally. Continue monitoring."}]
+
+        # Insight 1: Critical incident rate
+        p1_count = sev_dist.get("P1", 0)
+        p2_count = sev_dist.get("P2", 0)
+        critical_pct = round((p1_count + p2_count) / total * 100, 1) if total > 0 else 0
+        if critical_pct > 30:
+            insights.append({
+                "insight": f"{critical_pct}% of incidents are high severity (P1/P2 = {p1_count + p2_count} incidents)",
+                "severity": "critical",
+                "recommendation": "Immediate infrastructure review needed. High critical incident rate suggests systemic issues. Conduct root cause analysis and implement proactive monitoring alerts."
+            })
+        elif critical_pct > 15:
+            insights.append({
+                "insight": f"Elevated critical incident rate: {critical_pct}% are P1/P2 ({p1_count + p2_count} of {total} incidents)",
+                "severity": "high",
+                "recommendation": "Review on-call escalation procedures and add circuit breakers for high-frequency failure points. Consider chaos engineering to identify weaknesses proactively."
+            })
+        else:
+            insights.append({
+                "insight": f"Healthy severity distribution: only {critical_pct}% critical incidents ({p1_count + p2_count} of {total})",
+                "severity": "low",
+                "recommendation": "Maintain current monitoring coverage. Focus on reducing P3/P4 incidents to keep operational load manageable."
+            })
+
+        # Insight 2: MTTR analysis
+        if avg_mttr:
+            slowest_sev = max(avg_mttr, key=lambda k: avg_mttr[k] or 0)
+            slowest_mins = round((avg_mttr[slowest_sev] or 0) / 60, 1)
+            p1_mttr_mins = round((avg_mttr.get("P1", 0) or 0) / 60, 1)
+
+            if p1_mttr_mins > 60:
+                insights.append({
+                    "insight": f"P1 MTTR is {p1_mttr_mins} minutes — exceeding 1-hour SLA threshold",
+                    "severity": "high",
+                    "recommendation": f"P1 resolution is taking {p1_mttr_mins:.0f} min on average. Implement automated runbooks, improve on-call response with paging escalation, and establish dedicated war-room protocols for critical incidents."
+                })
+            elif slowest_mins > 120:
+                insights.append({
+                    "insight": f"{slowest_sev} incidents average {slowest_mins} minutes to resolve",
+                    "severity": "medium",
+                    "recommendation": f"Mean time to resolution for {slowest_sev} is {slowest_mins:.0f} minutes. Investigate bottlenecks in the resolution workflow — consider pre-written runbooks and automated remediation scripts."
+                })
+            else:
+                insights.append({
+                    "insight": f"Resolution times within acceptable range (worst: {slowest_sev} at {slowest_mins:.0f} min avg)",
+                    "severity": "low",
+                    "recommendation": "Good MTTR performance. Document successful resolution patterns as runbooks to maintain this benchmark as system complexity grows."
+                })
+
+        # Insight 3: Recurring problem areas (top tags)
+        if top_tags and len(top_tags) >= 2:
+            top1 = top_tags[0]
+            top2 = top_tags[1]
+            insights.append({
+                "insight": f"Top recurring problem areas: '{top1['tag']}' ({top1['count']} incidents), '{top2['tag']}' ({top2['count']} incidents)",
+                "severity": "medium",
+                "recommendation": f"Components tagged '{top1['tag']}' and '{top2['tag']}' are high-frequency failure points. Prioritize stability improvements, add dedicated health checks, and consider ownership reviews for these services."
+            })
+
+        # Insight 4: Peak hour clustering
+        if peak_hour is not None:
+            peak_next = (peak_hour + 1) % 24
+            is_business_hours = 8 <= peak_hour <= 18
+            if is_business_hours:
+                insights.append({
+                    "insight": f"Peak incident window is {peak_hour:02d}:00–{peak_next:02d}:00 UTC (business hours overlap)",
+                    "severity": "medium",
+                    "recommendation": "Incidents peak during business hours — likely correlated with deployment activity or peak user traffic. Enforce deployment freeze windows during high-traffic periods and increase monitoring sensitivity during these hours."
+                })
+            else:
+                insights.append({
+                    "insight": f"Peak incident window is {peak_hour:02d}:00–{peak_next:02d}:00 UTC (off-hours)",
+                    "severity": "medium",
+                    "recommendation": "Off-hours peak suggests batch jobs, scheduled tasks, or reduced oversight are contributing factors. Review scheduled job configurations and ensure on-call coverage is adequately staffed for this window."
+                })
+
+        # Insight 5: Open/unresolved incidents
+        open_count = status_dist.get("open", 0) + status_dist.get("acknowledged", 0) + status_dist.get("investigating", 0)
+        if open_count > 0 and total > 0:
+            open_pct = round(open_count / total * 100, 1)
+            if open_pct > 20:
+                insights.append({
+                    "insight": f"{open_count} incidents ({open_pct}%) are still active/unresolved",
+                    "severity": "high",
+                    "recommendation": "High backlog of unresolved incidents. Conduct a triage session to close stale incidents, reassign unowned ones, and implement SLA auto-escalation for incidents open beyond their severity threshold."
+                })
+
+        return insights[:5]  # Cap at 5 insights
 
 
 # === Event Handler ===
