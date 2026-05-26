@@ -134,7 +134,6 @@ export default function IncidentDetailPage({ params }: { params: { id: string } 
 
   const isResolved = incident.status === 'resolved';
   const isClosed = incident.status === 'closed';
-  const isResolvedOrClosed = isResolved || isClosed;
 
   return (
     <div className="min-h-screen bg-[var(--bg-primary)]">
